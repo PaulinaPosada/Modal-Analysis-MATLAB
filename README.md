@@ -1,1 +1,364 @@
-# Modal-Analysis-MATLAB
+# Análisis Estructural y de Fatiga — Brazo de Rociador John Deere
+
+---
+
+## Descripción General
+
+Este repositorio contiene el análisis completo del brazo de rociador de una aspersora agrícola **John Deere**, partiendo de señales de aceleración registradas en campo hasta la evaluación de fatiga estructural mediante el método de elementos finitos (MEF) y el conteo Rainflow.
+
+El flujo de cálculo es estrictamente **determinista y secuencial**: cada módulo del script produce resultados intermedios que alimentan al siguiente. No existe aleatoriedad ni iteración estocástica; la única fuente de variabilidad es la señal de campo original.
+
+---
+
+## Tabla de Contenidos
+
+1. [Estructura del Repositorio](#estructura-del-repositorio)
+2. [Arquitectura Determinista del Código](#arquitectura-determinista-del-código-main2m)
+   - [Bloque A — Carga y Preprocesamiento](#bloque-a--carga-y-preprocesamiento-de-señales-pasos-02)
+   - [Bloque B — Análisis Espectral PSD](#bloque-b--análisis-espectral-psd-comparativo-pasos-34)
+   - [Bloque C — MEF Truss 2D](#bloque-c--modelo-de-elementos-finitos-mef-truss-2d-pasos-511)
+   - [Bloque D — Fatiga Rainflow](#bloque-d--historia-de-esfuerzos-y-fatiga-rainflow-pasos-1214)
+3. [Dependencias de MATLAB](#dependencias-de-matlab)
+4. [Reproducibilidad](#reproducibilidad)
+5. [Figuras Representativas](#figuras-representativas)
+6. [Referencias](#referencias)
+
+---
+
+## Estructura del Repositorio
+
+```
+brazo_rociador/
+├── main2.m                          # Script principal de MATLAB
+├── data/
+│   ├── ts1.txt                      # Señal de aceleración — Evento 1
+│   ├── ts2.txt                      # Señal de aceleración — Evento 2
+│   ├── ts3.txt                      # Señal de aceleración — Evento 3
+│   └── ts4.txt                      # Señal de aceleración — Evento 4
+├── resultados/
+│   ├── aceleraciones_evento_sN.xlsx  # Envolvente del pico sostenido por señal
+│   ├── historia_esfuerzos_brazo_JD.xlsx
+│   └── historia_esfuerzos_brazo_JD.csv
+├── figuras/
+│   ├── psd_comparativa.png
+│   ├── stress_history_elem38.png
+│   ├── deformacion_peso_propio.png
+│   ├── rainflow_3d.png
+│   └── turning_points.png
+├── docs/
+│   └── metodologia.md
+└── README.md
+```
+
+---
+
+## Arquitectura Determinista del Código (`main2.m`)
+
+El script está organizado en **14 pasos secuenciales** agrupados en cuatro bloques funcionales. Cada bloque tiene entradas y salidas claramente definidas; el orden no es intercambiable.
+
+```
+BLOQUE A                BLOQUE B                BLOQUE C               BLOQUE D
+Señal de Campo  ──►  Análisis Espectral  ──►  MEF (Truss 2D)  ──►  Fatiga Rainflow
+(Pasos 0–2)           (Pasos 3–4)             (Pasos 5–11)           (Pasos 12–14)
+```
+
+---
+
+### Bloque A — Carga y Preprocesamiento de Señales (Pasos 0–2)
+
+**Entradas:** `ts1.txt … ts4.txt`  
+**Salidas:** vectores `t`, `x`, `x_filtrada`, `silueta_arriba`, archivos `aceleraciones_evento_sN.xlsx`
+
+#### Paso 0 — Inicialización
+
+```matlab
+clear; clc;
+addpath(genpath(pwd));
+segnal = s1;        % Selector de señal activo
+data   = load(segnal);
+t = data(:,1);      % Vector de tiempo [s]
+x = data(:,2);      % Vector de aceleración [g]
+Fs = 1 / (t(2) - t(1));   % Frecuencia de muestreo calculada automáticamente
+```
+
+- Las cuatro señales (`ts1`–`ts4`) tienen **600 000 muestras** cada una a **Fs = 1 000 Hz**.
+- El parámetro `segnal` actúa como un interruptor: cambiar su valor redirige todo el análisis posterior a la señal correspondiente.
+
+#### Paso 1 — Filtrado Butterworth Banda 0.1–10 Hz
+
+Se aplican dos filtros IIR de orden 4 en cascada con `filtfilt` (fase cero):
+
+```matlab
+[b_hp, a_hp] = butter(4, 0.1/(Fs/2), 'high');   % Pasa-altas: elimina componente DC y deriva
+[b_lp, a_lp] = butter(4, 10/(Fs/2),  'low');    % Pasa-bajas: elimina ruido de alta frecuencia
+x_temp     = filtfilt(b_hp, a_hp, x_limpia);
+x_filtrada = filtfilt(b_lp, a_lp, x_temp);
+```
+
+> La banda 0.1–10 Hz corresponde al rango de frecuencias estructuralmente relevantes para el brazo (confirmado por el análisis PSD posterior).
+
+#### Paso 2 — Detección del Evento Pico Sostenido (Envolvente Analítica)
+
+```matlab
+[silueta_arriba, ~] = envelope(x, 1000, 'analytic');
+[accel_max, idx_max] = max(silueta_arriba);
+
+% Umbral adaptativo por señal
+if segnal == s4
+    umbral = accel_max * 0.70;
+else
+    umbral = accel_max * 0.85;
+end
+
+puntos_zona_densa = find(silueta_arriba >= umbral);
+idx_inicio = puntos_zona_densa(1);
+idx_fin    = puntos_zona_densa(end);
+```
+
+- La ventana de 1 000 puntos en `envelope` equivale a **1 segundo** de señal, apropiada para capturar eventos sísmicos o de impacto.
+- El umbral del 85% (70% para `ts4`) es un parámetro calibrado manualmente para aislar el evento de mayor energía sin incluir transitorios menores.
+- El fragmento aislado se exporta a Excel para trazabilidad.
+
+---
+
+### Bloque B — Análisis Espectral PSD Comparativo (Pasos 3–4)
+
+**Entradas:** `ts1.txt … ts4.txt` (loop sobre las 4 señales)  
+**Salidas:** struct `resultados_psd`, figura comparativa, vector `frecuencias_excitacion`
+
+#### Paso 3 — Estimación PSD por Método de Welch
+
+```matlab
+resolucion_Hz_k = 0.05;                           % Resolución frecuencial objetivo
+long_ventana_k  = round(Fs_k / resolucion_Hz_k);  % Longitud de ventana en muestras
+overlap_k       = round(long_ventana_k * 0.5);    % Traslape del 50%
+[psd_k, f_k] = pwelch(x_filtrada_k, hann(long_ventana_k), overlap_k, long_ventana_k, Fs_k);
+```
+
+- Resolución de **0.05 Hz** permite discriminar modos cercanos en la banda estructural (1–3 Hz).
+- Ventana de **Hann** reduce fugas espectrales (compromiso entre resolución y dispersión).
+- Traslape del **50%** es el estándar para señales cuasi-estacionarias (Welch, 1967).
+
+#### Paso 4 — Cálculo de Indicadores y Consolidación
+
+Para cada señal se calculan determinísticamente:
+
+| Indicador | Fórmula | Propósito |
+|-----------|---------|-----------|
+| Frecuencia media `f_media` | f_m = m1 / m0, donde mn = ∫ fⁿ · S(f) df | Caracterizar el contenido frecuencial dominante |
+| Verificación RMS | RMS_PSD = √(∫ S(f) df) | Validar coherencia entre dominio tiempo y frecuencia |
+| Energía por bandas | Integral en [0–1], [1–3], [3–10] Hz | Identificar banda de mayor aportación energética |
+| Picos dominantes | `findpeaks` con prominencia ≥ 5% del máximo | Detectar frecuencias de excitación para el MEF |
+
+Los picos de las 4 señales se fusionan en un vector único `frecuencias_excitacion` agrupando valores con diferencia < 0.1 Hz:
+
+```matlab
+todas_frecuencias = sort([resultados_psd(k).picos_hz]);
+% Agrupación determinista por tolerancia de 0.1 Hz
+while i <= length(todas_frecuencias)
+    grupo = todas_frecuencias(abs(todas_frecuencias - todas_frecuencias(i)) <= 0.1);
+    frecuencias_excitacion(end+1) = mean(grupo);
+    i = i + sum(abs(todas_frecuencias - todas_frecuencias(i)) <= 0.1);
+end
+```
+
+**Resultados del análisis PSD:**
+
+| Señal | f_media (Hz) |
+|-------|-------------|
+| ts1   | 2.37        |
+| ts2   | 2.74        |
+| ts3   | 2.37        |
+| ts4   | 2.95        |
+
+---
+
+### Bloque C — Modelo de Elementos Finitos (MEF Truss 2D, Pasos 5–11)
+
+**Entradas:** geometría nodal, conectividad, propiedades de material  
+**Salidas:** vector de desplazamientos `U`, esfuerzos por elemento `st`, elemento crítico
+
+#### Paso 5 — Definición de Geometría y Materiales
+
+La estructura se discretiza en **38 nodos** y **73 elementos** tipo barra (truss):
+
+```matlab
+N = [id  X_mm  Y_mm];   % 38 filas
+
+% Sección transversal: tubo hueco de acero
+R_mayor = 50;      % mm — radio exterior
+r_menor = 40;      % mm — radio interior
+E_acero = 200000;  % MPa (módulo de Young)
+Area = pi * (R_mayor^2 - r_menor^2);  % mm²
+```
+
+La geometría refleja la forma real del brazo: zona de celosía triangular en los primeros tramos y sección longitudinal en la punta.
+
+#### Paso 6 — Ensamble de la Matriz de Rigidez Global
+
+```matlab
+% Rigidez axial de cada elemento
+Le = sqrt((Xj - Xi)^2 + (Yj - Yi)^2);  % Longitud en mm
+k  = E * Area / Le;                      % [N/mm]
+
+% Cosenos directores
+c = (Xj - Xi) / Le;
+s = (Yj - Yi) / Le;
+
+% Matriz elemental 4x4 en sistema global
+Ke(:,:,i) = k * [ c^2   c*s  -c^2  -c*s;
+                  c*s   s^2  -c*s  -s^2;
+                 -c^2  -c*s   c^2   c*s;
+                 -c*s  -s^2   c*s   s^2];
+
+% Ensamble en K global (2·nN × 2·nN)
+K(L(i,:), L(i,:)) = K(L(i,:), L(i,:)) + Ke(:,:,i);
+```
+
+#### Paso 7 — Aplicación de Cargas (Peso Propio, 1g)
+
+```matlab
+densidad_acero = 7850;  % kg/m³
+gravedad = 9.81;        % m/s²
+gamma_mm3 = (densidad_acero * gravedad) / 1e9;  % N/mm³
+
+Peso_Total_N = sum(Area_elementos .* Le * gamma_mm3);
+
+% Distribución uniforme en grados de libertad verticales
+F(2:2:2*nN) = -(1.0) * Peso_Total_N / nN;
+```
+
+> La excitación se escala a 1g, valor que luego se multiplica por la aceleración real del evento para obtener la respuesta dinámica.
+
+#### Paso 8 — Condiciones de Frontera y Solución
+
+Nodos restringidos: 1, 2 y 3 (anclaje al tractor):
+
+```matlab
+DoF_C = [1 2 3 4 5 6];   % 3 nodos × 2 GDL = 6 restricciones
+DoF_A = setdiff(1:2*nN, DoF_C);
+
+% Solución directa (sistema lineal)
+Ua = K(DoF_A, DoF_A) \ (F(DoF_A) - K(DoF_A, DoF_C) * U(DoF_C));
+```
+
+#### Paso 9 — Cálculo de Esfuerzos por Elemento
+
+```matlab
+for i = 1:nE
+    u1 = U(2*E(i,2)-1)*c(i) + U(2*E(i,2))*s(i);  % Desp. axial nodo i
+    u2 = U(2*E(i,3)-1)*c(i) + U(2*E(i,3))*s(i);  % Desp. axial nodo j
+    ep(i) = (u2 - u1) / Le(i);                     % Deformación unitaria
+    st(i) = E_acero * ep(i);                        % Esfuerzo [MPa]
+end
+```
+
+La linealidad del modelo permite escalar directamente los esfuerzos con la aceleración aplicada.
+
+#### Pasos 10–11 — Identificación del Elemento Crítico y Deformación
+
+```matlab
+[max_sig_u, idx_elem] = max(abs(st));
+elemento_critico = E(idx_elem, 1);   % → Elemento #38
+```
+
+El **Elemento #38** (conexión en la punta del brazo) resulta el más solicitado, con esfuerzos máximos de ~140 MPa bajo la aceleración pico registrada, manteniéndose por debajo del límite elástico del acero (300 MPa).
+
+---
+
+### Bloque D — Historia de Esfuerzos y Fatiga Rainflow (Pasos 12–14)
+
+**Entradas:** vector `st` del MEF, archivos `aceleraciones_evento_sN.xlsx`  
+**Salidas:** `historia_esfuerzos_brazo_JD.xlsx`, tabla Rainflow, conteo de ciclos
+
+#### Paso 12 — Construcción de la Historia de Esfuerzos Temporal
+
+```matlab
+% Concatenar aceleraciones de todos los eventos
+acc_completa = [acc_s1; acc_s2; acc_s3_p1; acc_s3_p2; acc_s3_p3; acc_s4];
+
+% Escalar esfuerzo con el elemento crítico
+esfuerzo_temporal_total = max_sig_u * acc_completa;
+```
+
+La hipótesis determinista clave: **los esfuerzos en el elemento crítico son proporcionales a la aceleración de campo** (respuesta lineal del sistema estructural).
+
+#### Paso 13 — Conteo Rainflow
+
+El conteo sigue el procedimiento normalizado de tres etapas:
+
+1. **Filtrado por histéresis** (`threshold = 30 MPa`): elimina oscilaciones de baja amplitud que no contribuyen al daño.
+2. **Filtrado pico-valle** (`hpvfilter`): conserva únicamente los extremos locales significativos.
+3. **Conteo de ciclos** (`rainflow`): aplica el algoritmo ASTM E1049 para extraer ciclos cerrados y semiciclos.
+
+```matlab
+threshold = 30;  % MPa — umbral de histéresis
+[turningptsg, indg] = findTurningPts(sg, threshold);
+rfCountg = rainflow(turningptsg, tg(indg), "ext");
+```
+
+La salida `rfCountg` contiene para cada ciclo: conteo, rango de esfuerzo, media, tiempo de inicio y fin.
+
+#### Paso 14 — Daño Acumulado (Palmgren-Miner)
+
+El código incluye las funciones auxiliares para completar el análisis de daño:
+
+```matlab
+% Curva S-N bilineal en escala log-log
+plModel = piecewiseLinearFit(Nf, S);
+
+% Vida estimada para un nivel de esfuerzo
+Nfi = estimateFatigueLife(plModel, Si);
+
+% Daño acumulado: D = sum(ni / Nf,i)
+damage = sum(ni ./ Nfi);   % Fallo si D >= 1
+```
+
+> **Nota:** el cálculo de daño requiere alimentar la curva S-N experimental del material. Las funciones `piecewiseLinearFit`, `computeStress` y `estimateFatigueLife` están implementadas como funciones locales al final del script.
+
+---
+
+## Dependencias de MATLAB
+
+| Toolbox | Funciones utilizadas |
+|---------|---------------------|
+| Signal Processing Toolbox | `butter`, `filtfilt`, `envelope`, `pwelch`, `fftshift` |
+| Predictive Maintenance Toolbox | `rainflow`, `findTurningPts` (local), `hpvfilter` (local) |
+| Base MATLAB | `findpeaks`, `polyfit`, `trapz`, `writematrix`, `readtable` |
+
+---
+
+## Reproducibilidad
+
+Para reproducir el análisis completo:
+
+1. Colocar los archivos `ts1.txt` – `ts4.txt` en la misma carpeta que `main2.m` (o ajustar `addpath`).
+2. Ejecutar `main2.m` desde la carpeta raíz del proyecto.
+3. Los archivos de resultados (`aceleraciones_evento_sN.xlsx`, `historia_esfuerzos_brazo_JD.xlsx`) se generan automáticamente en el directorio de trabajo.
+4. Para analizar una señal diferente, cambiar el valor de `segnal` en el Paso 0:
+
+```matlab
+segnal = s2;  % Cambia a ts2.txt
+```
+
+---
+
+## Figuras Representativas
+
+| Figura | Descripción |
+|--------|-------------|
+| `psd_comparativa.png` | Densidad Espectral de Potencia comparativa — 4 señales |
+| `stress_history_elem38.png` | Historia de esfuerzos en el Elemento Crítico #38 |
+| `deformacion_peso_propio.png` | Deformación estructural bajo peso propio (escala ×10) |
+| `rainflow_3d.png` | Histograma 3D del conteo Rainflow (ciclos vs. rango vs. media) |
+| `turning_points.png` | Señal filtrada con puntos de cambio identificados |
+
+---
+
+## Referencias
+
+- Downing, S. D., & Socie, D. F. (1982). Simple rainflow counting algorithms. *International Journal of Fatigue, 4*(1), 31–40. https://doi.org/10.1016/0142-1123(82)90018-4
+- Welch, P. D. (1967). The use of fast Fourier transform for the estimation of power spectra. *IEEE Transactions on Audio and Electroacoustics, 15*(2), 70–73. https://doi.org/10.1109/TAU.1967.1161901
+- ASTM International. (2017). *ASTM E1049-85(2017): Standard practices for cycle counting in fatigue analysis*. ASTM International.
+- MathWorks. (2024). *Signal Processing Toolbox — User's Guide*. The MathWorks, Inc.
+- Paz, M., & Kim, Y. H. (2019). *Structural Dynamics: Theory and Computation* (6th ed.). Springer. https://doi.org/10.1007/978-3-319-94743-3
